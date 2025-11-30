@@ -1,8 +1,8 @@
 {
-  "name": "konva",
-  "version": "10.0.12",
-  "description": "HTML5 2d canvas library.",
-  "author": "Anton Lavrenov",
+  "name": "@content2book/konva-custom",
+  "version": "10.0.12-multistyledtext",
+  "description": "Konva.js with MultiStyledText shape for Content2Book",
+  "author": "Content2Book Team",
   "type": "module",
   "files": [
     "README.md",
