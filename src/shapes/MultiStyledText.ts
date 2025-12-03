@@ -59,6 +59,10 @@ export interface MultiStyledTextConfig extends ShapeConfig {
   letterSpacing?: number;
   wrap?: string;
   ellipsis?: boolean;
+  overflowIndicator?: boolean;
+  overflowStroke?: string;
+  overflowStrokeWidth?: number;
+  backgroundFill?: string;
 }
 
 export class MultiStyledText extends Shape<MultiStyledTextConfig> {
@@ -73,6 +77,11 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
   public textStyles!: GetSet<TextStyle[], this>
   public wrap!: GetSet<'word' | 'char' | 'none', this>
   public ellipsis!: GetSet<boolean, this>
+  public overflowIndicator!: GetSet<boolean, this>
+  public overflowStroke!: GetSet<string, this>
+  public overflowStrokeWidth!: GetSet<number, this>
+  public backgroundFill!: GetSet<string | undefined, this>
+  public debugBounds!: GetSet<boolean, this>
 
   private textLines: {
     width: number
@@ -81,6 +90,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
   }[] = []
   private linesWidth!: number
   private linesHeight!: number
+  private hasOverflowFlag = false
 
   // used when drawing
   private drawState!: {
@@ -100,11 +110,11 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
     this.computeTextParts()
   }
 
-  private formatFont (part: Pick<TextPart, 'style'>) {
+  private formatFont(part: Pick<TextPart, 'style'>) {
     return `${part.style.fontStyle} ${part.style.fontVariant} ${part.style.fontSize}px ${normalizeFontFamily(part.style.fontFamily)}`
   }
 
-  private measurePart (part: Omit<TextPart, 'width'>) {
+  private measurePart(part: Omit<TextPart, 'width'>) {
     const context = getDummyContext()
     context.save()
     context.font = this.formatFont(part)
@@ -113,25 +123,38 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
     return width
   }
 
-  private computeTextParts () {
+  private computeTextParts() {
     this.textLines = []
+    this.hasOverflowFlag = false
     const lines = this.text().split('\n')
     const maxWidth = this.attrs.width
     const maxHeight = this.attrs.height
     const hasFixedWidth = maxWidth !== 'auto' && maxWidth !== undefined
     const hasFixedHeight = maxHeight !== 'auto' && maxHeight !== undefined
-
+    const styles = this.textStyles()
+    if (!styles || styles.length === 0) {
+      throw new Error('MultiStyledText: textStyles is empty. Provide at least one style covering the text.')
+    }
     const shouldWrap = this.wrap() !== 'none'
     const wrapAtWord = this.wrap() !== 'char' && shouldWrap
     const shouldAddEllipsis = this.ellipsis()
-    const styles = this.textStyles()
-    const ellipsis = '…'
-    const additionalWidth = shouldAddEllipsis ? this.measurePart({ text: ellipsis, style: styles[styles.length - 1] }) : 0;
+    const padding = this.padding()
+    const availableWidth = hasFixedWidth
+      ? Math.max(0, Number(maxWidth) - padding * 2)
+      : Number.POSITIVE_INFINITY
+    const availableHeight = hasFixedHeight
+      ? Math.max(0, Number(maxHeight) - padding * 2)
+      : Number.POSITIVE_INFINITY
+    const ellipsis = 'XXX'
 
     const stylesByChar = Array.from(this.text()).map((char, index) => {
+      const style = styles.find((style) => index >= style.start && (typeof style.end === 'undefined' || style.end >= index))
+      if (!style) {
+        throw new Error(`MultiStyledText: missing style for char index ${index}`)
+      }
       return {
         char,
-        style: styles.find((style) => index >= style.start && (typeof style.end === 'undefined' || style.end >= index))!
+        style
       }
     })
     const findParts = (start: number, end: number) => {
@@ -152,41 +175,65 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
     const measureSubstring = (start: number, end: number) => {
       return measureParts(findParts(start, end))
     }
+    const measurePartWithSpacing = (part: Omit<TextPart, 'width'>) => {
+      const base = this.measurePart(part as TextPart)
+      const perCharSpacing = this.letterSpacing() * Math.max(part.text.length - 1, 0)
+      return base + perCharSpacing
+    }
     const measureParts = (parts: TextPart[]) => {
-      return parts.reduce((size, part) => {
-        part.width = this.measurePart(part)
-        return size + part.width
+      return parts.reduce((size, part, index) => {
+        const widthWithSpacing = measurePartWithSpacing(part)
+        part.width = widthWithSpacing
+        const interPartSpacing = index === parts.length - 1 ? 0 : this.letterSpacing()
+        return size + widthWithSpacing + interPartSpacing
       }, 0)
     }
     const measureHeightParts = (parts: TextPart[]) => {
+      // Empty lines still need a height so they render vertical space
+      if (parts.length === 0) {
+        const baseStyle = styles[0]!
+        return baseStyle.fontSize * this.lineHeight()
+      }
       return Math.max(...parts.map((part) => {
         return part.style.fontSize * this.lineHeight()
       }))
     }
     const addLine = (width: number, height: number, parts: TextPart[]) => {
-      // if element height is fixed, abort if adding one more line would overflow
-      // so we don't add this line, the loop will be broken anyway
-      if (hasFixedHeight && (currentHeight + height) > maxHeight) {
-        return
+      const baseStyle = styles[0]!
+      const safeHeight = Number.isFinite(height) ? height : baseStyle.fontSize * this.lineHeight()
+      const prospectiveHeight = currentHeight + safeHeight
+      const wouldOverflow = prospectiveHeight > availableHeight
+
+      if (hasFixedHeight && wouldOverflow) {
+        // console.log('[MultiStyledText] addLine skip', { currentHeight, safeHeight, availableHeight })
+        overflowed = true
+        truncated = true
+        return false
       }
+
       this.textLines.push({
         width,
         parts: parts.map((part) => {
-          // compute size if not already computed during part creation
           part.width = part.width === 0 ? this.measurePart(part) : part.width
           return part
         }),
-        totalHeight: height
+        totalHeight: safeHeight
       })
+      return true
     }
 
+    let overflowed = false
+    let truncated = false
+    let ellipsisAdded = false
     let currentHeight = 0
     let charCount = 0
-    for (let line of lines) {
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      let line = lines[lineIndex]
+      const originalLineLength = line.length
       let lineWidth = measureSubstring(charCount, charCount + line.length)
-      let lineHeight: number
+      let lineHeight = 0
 
-      if (hasFixedWidth && lineWidth > maxWidth) {
+      if (hasFixedWidth && lineWidth > availableWidth) {
         /*
          * if width is fixed and line does not fit entirely
          * break the line into multiple fitting lines
@@ -204,15 +251,15 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
           while (low < high) {
             var mid = (low + high) >>> 1,
               substr = line.slice(0, mid + 1),
-              substrWidth = measureSubstring(charCount + cursor, charCount + cursor + mid + 1) + additionalWidth
-            if (substrWidth <= maxWidth) {
+              substrWidth = measureSubstring(charCount + cursor, charCount + cursor + mid + 1)
+            if (substrWidth <= availableWidth) {
               low = mid + 1
-              match = substr
-              matchWidth = substrWidth
-            } else {
-              high = mid
-            }
+            match = substr
+            matchWidth = substrWidth
+          } else {
+            high = mid
           }
+        }
           /*
             * 'low' is now the index of the substring end
             * 'match' is the substring
@@ -225,7 +272,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
               let wrapIndex: number
               var nextChar = line[match.length]
               var nextIsSpaceOrDash = nextChar === ' ' || nextChar === '-'
-              if (nextIsSpaceOrDash && matchWidth <= maxWidth) {
+              if (nextIsSpaceOrDash && matchWidth <= availableWidth) {
                 wrapIndex = match.length
               } else {
                 wrapIndex = Math.max(match.lastIndexOf(' '), match.lastIndexOf('-')) + 1
@@ -240,18 +287,37 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
             // match = match.trimRight()
             const parts = findParts(charCount + cursor, charCount + cursor + low)
             lineHeight = measureHeightParts(parts)
-            addLine(measureParts(parts), lineHeight, parts)
+            const lineWidthMeasured = measureParts(parts)
+            const added = addLine(lineWidthMeasured, lineHeight, parts)
+            if (!added) {
+              break
+            }
             currentHeight += lineHeight
             if (
               !shouldWrap ||
-              (hasFixedHeight && currentHeight + lineHeight > maxHeight)
+              (hasFixedHeight && currentHeight + lineHeight > availableHeight)
             ) {
               const lastLine = this.textLines[this.textLines.length - 1]
               if (lastLine) {
                 if (shouldAddEllipsis) {
                   const lastPart = lastLine.parts[lastLine.parts.length - 1]
-                  const lastPartWidthWithEllipsis = this.measurePart({ ...lastPart, text: `${lastPart.text}${ellipsis}` })
-                  const haveSpace = lastPartWidthWithEllipsis < maxWidth
+                  if (!lastPart) {
+                    const styleForEllipsis = styles[styles.length - 1]!
+                    const width = this.measurePart({ text: ellipsis, style: styleForEllipsis })
+                    lastLine.parts.push({
+                      text: ellipsis,
+                      width,
+                      style: styleForEllipsis
+                    })
+                    lastLine.width = width
+                    ellipsisAdded = true
+                    overflowed = true
+                    break
+                  }
+                  const baseWidthWithoutLast = lastLine.width - (lastPart ? lastPart.width : 0)
+                  const spacingBetween = this.letterSpacing()
+                  const lastPartWidthWithEllipsis = measurePartWithSpacing({ ...lastPart, text: `${lastPart.text}${ellipsis}` })
+                  const haveSpace = (baseWidthWithoutLast + lastPartWidthWithEllipsis + spacingBetween) < availableWidth
                   if (!haveSpace) {
                     lastPart.text = lastPart.text.slice(0, lastPart.text.length - 3)
                   }
@@ -261,6 +327,8 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
                     width: lastPartWidthWithEllipsis,
                     text: `${lastPart.text}${ellipsis}`
                   })
+                  overflowed = true
+                  ellipsisAdded = true
                 }
               }
 
@@ -268,60 +336,123 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
                 * stop wrapping if wrapping is disabled or if adding
                 * one more line would overflow the fixed height
                 */
-             break
+              // if we broke due to width/ellipsis and already accumulated height beyond available, mark truncation
+              const nextHeight = currentHeight + (lineHeight || 0)
+              if (hasFixedHeight && nextHeight > availableHeight) {
+                truncated = true
+              }
+              break
             }
             line = line.slice(low)
             cursor += low
             // line = line.trimLeft()
             if (line.length > 0) {
               // Check if the remaining text would fit on one line
-              const parts = findParts(charCount + cursor, charCount + cursor + line.length)
-              lineWidth = measureParts(parts)
-              if (lineWidth <= maxWidth) {
-                // if it does, add the line and break out of the loop
-                const height = measureHeightParts(parts)
-                addLine(lineWidth, height, parts)
+          const parts = findParts(charCount + cursor, charCount + cursor + line.length)
+          lineWidth = measureParts(parts)
+          if (lineWidth <= availableWidth) {
+            // if it does, add the line and break out of the loop
+            const height = measureHeightParts(parts)
+            const added = addLine(lineWidth, height, parts)
+            if (!added) {
+                  break
+                }
                 currentHeight += height
                 break
               }
             }
           } else {
             // not even one character could fit in the element, abort
+            overflowed = true
+            truncated = true
             break
           }
         }
       } else {
         const parts = findParts(charCount, charCount + line.length)
         lineHeight = measureHeightParts(parts)
-        addLine(lineWidth, lineHeight, parts)
+        const lineWidthMeasured = measureParts(parts)
+        const added = addLine(lineWidthMeasured, lineHeight, parts)
+        if (!added) {
+          break
+        }
+        currentHeight += lineHeight
       }
 
-      // if element height is fixed, abort if adding one more line would overflow
-      // so we stop here to avoid processing useless lines
-      if (hasFixedHeight && (currentHeight + lineHeight!) > maxHeight) {
-        break
+      // account for the newline character that was removed by split()
+      const isLastLine = lineIndex === lines.length - 1
+      charCount += originalLineLength + (isLastLine ? 0 : 1)
+    }
+
+    // If overflow happened and ellipsis is enabled, append ellipsis to last visible line
+    if (overflowed && shouldAddEllipsis && hasFixedWidth && this.textLines.length > 0) {
+      const lastLine = this.textLines[this.textLines.length - 1]
+      const lastPart = lastLine.parts[lastLine.parts.length - 1]
+      const styleForEllipsis = lastPart?.style ?? styles[styles.length - 1]!
+      const ellipsisWidth = measurePartWithSpacing({ text: ellipsis, style: styleForEllipsis })
+      const baseWidthWithoutLast = lastLine.width - (lastPart ? lastPart.width : 0)
+
+      // If there is no part, just add the ellipsis and return
+      if (!lastPart) {
+        lastLine.parts.push({
+          text: ellipsis,
+          width: ellipsisWidth,
+          style: styleForEllipsis
+        })
+        lastLine.width = baseWidthWithoutLast + ellipsisWidth
+        this.linesWidth = Math.max(...this.textLines.map((line) => line.width, 0))
+        this.linesHeight = this.textLines.reduce((size, line) => size + line.totalHeight, 0)
+        return
       }
 
-      charCount += line.length
-      currentHeight += lineHeight!
+      if (lastPart) {
+        let newText = lastPart.text
+        const measureText = (t: string) => measurePartWithSpacing({ text: t, style: styleForEllipsis })
+        while (newText.length > 0 && (baseWidthWithoutLast + measureText(newText) + ellipsisWidth) > availableWidth) {
+          newText = newText.slice(0, -1)
+        }
+        lastPart.text = newText
+        lastPart.width = measureText(newText)
+        lastLine.parts[lastLine.parts.length - 1] = lastPart
+      }
+
+      lastLine.parts.push({
+        text: ellipsis,
+        width: ellipsisWidth,
+        style: styleForEllipsis
+      })
+      lastLine.width = baseWidthWithoutLast + (lastPart ? lastPart.width : 0) + ellipsisWidth
+      ellipsisAdded = true
     }
 
     this.linesHeight = this.textLines.reduce((size, line) => size + line.totalHeight, 0)
     this.linesWidth = Math.max(...this.textLines.map((line) => line.width, 0))
+    // console.log('[MultiStyledText] layout summary', {
+    //   lines: this.textLines.length,
+    //   linesHeight: this.linesHeight,
+    //   availableHeight,
+    //   truncated,
+    //   ellipsisAdded
+    // })
+    this.hasOverflowFlag = truncated || ellipsisAdded
   }
 
-  public getHeight (): number {
+  public hasOverflow(): boolean {
+    return this.hasOverflowFlag
+  }
+
+  public getHeight(): number {
     const isAuto = this.attrs.height === 'auto' || this.attrs.height === undefined
     if (!isAuto) {
-      return this.attrs.height
+      return Number(this.attrs.height)
     }
     return this.linesHeight + this.padding() * 2
   }
 
-  public getWidth (): number {
+  public getWidth(): number {
     const isAuto = this.attrs.width === 'auto' || this.attrs.width === undefined
     if (!isAuto) {
-      return this.attrs.width
+      return Number(this.attrs.width)
     }
     return this.linesWidth + this.padding() * 2
   }
@@ -337,21 +468,52 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
 
     const totalWidth = this.getWidth()
     const totalHeight = this.getHeight()
-
-    context.setAttr('textBaseline', 'middle')
-    context.setAttr('textAlign', 'left')
-
-    // handle vertical alignment
     const padding = this.padding()
+
     let alignY = 0
     if (this.verticalAlign() === 'middle') {
       alignY = (totalHeight - this.linesHeight - padding * 2) / 2;
     } else if (this.verticalAlign() === 'bottom') {
       alignY = totalHeight - this.linesHeight - padding * 2;
     }
+
+    context.setAttr('textBaseline', 'top')
+    context.setAttr('textAlign', 'left')
+
+    // background fill for debug
+    if (this.backgroundFill()) {
+      context.save()
+      context.beginPath()
+      context.rect(0, 0, totalWidth, totalHeight)
+      context.setAttr('fillStyle', this.backgroundFill())
+      context.fill()
+      context.restore()
+    }
+    // debug bounds stroke (computed text area)
+    if (this.debugBounds()) {
+      context.save()
+      context.beginPath()
+      context.rect(padding, alignY + padding, this.linesWidth, this.linesHeight)
+      context.setAttr('strokeStyle', '#007bff')
+      context.setAttr('lineWidth', 1)
+      context.stroke()
+      context.restore()
+    }
+
+    // visual overflow indicator (outline) if enabled
+    if (this.overflowIndicator() && this.hasOverflowFlag) {
+      context.save()
+      context.beginPath()
+      context.rect(0, 0, totalWidth, totalHeight)
+      context.setAttr('strokeStyle', this.overflowStroke())
+      context.setAttr('lineWidth', this.overflowStrokeWidth())
+      context.stroke()
+      context.restore()
+    }
+
     context.translate(padding, alignY + padding)
 
-    let y = this.textLines[0].totalHeight / 2
+    let y = 0
     let lineIndex = 0
     for (const line of this.textLines) {
       const isLastLine = lineIndex === this.textLines.length - 1
@@ -363,7 +525,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
       if (this.align() === 'right') {
         lineX += totalWidth - line.width - padding * 2
       } else if (this.align() === 'center') {
-        lineY += (totalWidth - line.width - padding * 2) / 2
+        lineX += (totalWidth - line.width - padding * 2) / 2
       }
 
       for (const part of line.parts) {
@@ -375,7 +537,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
 
           context.moveTo(
             lineX,
-            y + lineY + Math.round(part.style.fontSize / 2)
+            y + lineY + Math.round(part.style.fontSize)
           )
           const spacesNumber = part.text.split(' ').length - 1
           const oneWord = spacesNumber === 0
@@ -385,7 +547,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
               : part.width
           context.lineTo(
             lineX + Math.round(lineWidth),
-            y + lineY + Math.round(part.style.fontSize / 2)
+            y + lineY + Math.round(part.style.fontSize)
           )
 
           // I have no idea what is real ratio
@@ -398,7 +560,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
         if (part.style.textDecoration.includes('line-through')) {
           context.save()
           context.beginPath()
-          context.moveTo(lineX, y + lineY)
+          context.moveTo(lineX, y + lineY + part.style.fontSize / 2)
           const spacesNumber = part.text.split(' ').length - 1
           const oneWord = spacesNumber === 0
           const lineWidth =
@@ -407,7 +569,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
               : part.width
           context.lineTo(
             lineX + Math.round(lineWidth),
-            y + lineY
+            y + lineY + part.style.fontSize / 2
           )
           context.lineWidth = part.style.fontSize / 15
           context.strokeStyle = part.style.fill
@@ -425,6 +587,7 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
           var array = Array.from(part.text)
           for (let li = 0; li < array.length; li++) {
             const letter = array[li]
+            const isLastLetter = li === array.length - 1
             // skip justify for the last line
             if (letter === ' ' && lineIndex !== this.textLines.length - 1 && this.align() === 'justify') {
               lineX += (totalWidth - padding * 2 - line.width) / spacesNumber;
@@ -435,7 +598,11 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
               text: letter
             }
             context.fillStrokeShape(this)
-            lineX += this.measurePart({ ...part, text: letter }) + this.letterSpacing()
+            const advance = this.measurePart({ ...part, text: letter })
+            lineX += advance
+            if (!isLastLetter) {
+              lineX += this.letterSpacing()
+            }
           }
         } else {
           this.drawState = {
@@ -444,14 +611,16 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
             text: part.text
           }
           context.fillStrokeShape(this)
-          lineX += part.width + this.letterSpacing()
+          lineX += part.width
+          const isLastPartInLine = line.parts[line.parts.length - 1] === part
+          if (!isLastPartInLine) {
+            lineX += this.letterSpacing()
+          }
         }
       }
 
       context.restore()
-      if (typeof this.textLines[lineIndex + 1] !== 'undefined') {
-        y += this.textLines[lineIndex + 1].totalHeight
-      }
+      y += line.totalHeight
       ++lineIndex
     }
   }
@@ -487,6 +656,15 @@ export class MultiStyledText extends Shape<MultiStyledTextConfig> {
   // if we do, the result will be unexpected
   public getStrokeScaleEnabled() {
     return true
+  }
+
+  // Debug helper for tests/labs
+  public getDebugLines() {
+    return this.textLines.map((line) => ({
+      width: line.width,
+      totalHeight: line.totalHeight,
+      parts: line.parts.map((part) => part.text)
+    }))
   }
 }
 _registerNode(MultiStyledText)
@@ -634,6 +812,13 @@ Factory.addGetterSetter(MultiStyledText, 'ellipsis', false, getBooleanValidator(
  */
 Factory.addGetterSetter(MultiStyledText, 'letterSpacing', 0, getNumberValidator())
 
+// overflow visual indicator
+Factory.addGetterSetter(MultiStyledText, 'overflowIndicator', false, getBooleanValidator())
+Factory.addGetterSetter(MultiStyledText, 'overflowStroke', '#ff0000', getStringValidator())
+Factory.addGetterSetter(MultiStyledText, 'overflowStrokeWidth', 1, getNumberValidator())
+Factory.addGetterSetter(MultiStyledText, 'backgroundFill')
+Factory.addGetterSetter(MultiStyledText, 'debugBounds', false, getBooleanValidator())
+
 /**
  * get/set text
  * @name Konva.Text#text
@@ -659,14 +844,4 @@ Factory.addGetterSetter(MultiStyledText, 'text', '', getStringValidator())
  * // set styles
  * text.textStyles([{ start: 0, fontFamily: 'Roboto' }]);
  */
-const defaultStyle: TextStyle = {
-  start: 0,
-  fill: 'black',
-  stroke: 'black',
-  fontFamily: 'Arial',
-  fontSize: 12,
-  fontStyle: 'normal',
-  fontVariant: 'normal',
-  textDecoration: ''
-}
-Factory.addGetterSetter(MultiStyledText, 'textStyles', [defaultStyle])
+Factory.addGetterSetter(MultiStyledText, 'textStyles')
